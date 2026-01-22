@@ -1,0 +1,345 @@
+use crate::front::ast::*;
+use std::process::exit;
+
+// lalrpop 里的约定
+grammar;
+
+pub CompUnit: CompUnit = {
+    <item: GlobalItem> => CompUnit {
+        items: vec![item],
+    },
+    <mut c: CompUnit> <item: GlobalItem> => CompUnit {
+        items: {
+            c.items.push(item);
+            c.items
+        },
+    },
+};
+
+GlobalItem: GlobalItem = {
+    <decl: Decl> => GlobalItem::Decl(decl),
+    <func: FuncDef> => GlobalItem::FuncDef(func),
+};
+
+FuncDef: FuncDef = {
+    <start: @L><ty: DataType> <name: IDENT> "(" <params: FuncFParams?> ")" <body: Block><end: @R> => FuncDef {
+        ty,
+        name,
+        params: params.unwrap_or_default(),
+        body,
+        span: Span::from_span(start, end),
+    }
+};
+
+Block: Block = {
+    "{" <items: BlockItem*> "}" => items,
+};
+
+// BlockItem ::= Decl | Stmt;
+BlockItem: BlockItem = {
+    <decl: Decl> => BlockItem::Decl(decl),
+    <stmt: Stmt> => BlockItem::Stmt(stmt),
+};
+
+// Decl ::= ConstDecl | VarDecl;
+Decl: Decl = {
+    ConstDecl,
+    VarDecl,
+};
+
+// ConstDecl ::= "const" DataType ConstDef {"," ConstDef} ";";
+ConstDecl: Decl = {
+    <start: @L>"const" <ty: DataType> <first: ConstDef> <rest: ("," ConstDef)*> ";" <end: @R> => {
+        if ty == DataType::Void {
+            eprintln!("Error: 常量声明不允许使用 void 类型");
+            exit(1);
+        }
+        let mut defs = vec![first];
+        defs.extend(rest.into_iter().map(|(_, d)| d));
+        Decl::ConstDecl(ConstDecl {
+            ty,
+            defs,
+            span: Span::from_span(start, end),
+        })
+    }
+};
+
+// DataType ::= "int" | "void";
+DataType: DataType = {
+    "int" => DataType::Int,
+    "void" => DataType::Void,
+};
+
+// ConstDef ::= IDENT {"[" ConstExp "]"} "=" ConstInitVal;
+ConstDef: ConstDef = {
+    <start: @L><name: IDENT> <dims: ("[" ConstExp "]")*> "=" <init: ConstInitVal><end: @R> => ConstDef {
+        name,
+        dims: dims.into_iter().map(|(_, d, _)| d).collect(),
+        init,
+        span: Span::from_span(start, end),
+    }
+};
+
+// ConstInitVal ::= ConstExp | "{" [ConstInitVal {"," ConstInitVal}] "}";
+ConstInitVal: ConstInitVal = {
+    <expr: ConstExp> => ConstInitVal::Single(expr),
+    <start: @L>"{" <first: ConstInitVal?> <rest: ("," ConstInitVal)*> "}"<end: @R> => {
+        let mut list = vec![];
+        if let Some(f) = first {
+            list.push(f);
+        }
+        list.extend(rest.into_iter().map(|(_, e)| e));
+        ConstInitVal::List(list)
+    }
+};
+
+// ConstExp ::= Exp;
+ConstExp: Expr = {
+    Exp
+};
+
+// VarDecl ::= DataType VarDef {"," VarDef} ";";
+VarDecl: Decl = {
+    <start: @L><ty: DataType> <first: VarDef> <rest: ("," VarDef)*> ";" <end: @R> => {
+        if ty == DataType::Void {
+            eprintln!("Error: 变量声明不允许使用 void 类型");
+            exit(1);
+        }
+        let mut defs = vec![first];
+        defs.extend(rest.into_iter().map(|(_, d)| d));
+        Decl::VarDecl(VarDecl {
+            ty,
+            defs,
+            span: Span::from_span(start, end),
+        })
+    }
+};
+
+// VarDef ::= IDENT {"[" ConstExp "]"} | IDENT {"[" ConstExp "]"} "=" InitVal;
+VarDef: VarDef = {
+    <start: @L><name: IDENT> <dims: ("[" ConstExp "]")*> <end: @R> => VarDef {
+        name,
+        dims: dims.into_iter().map(|(_, d, _)| d).collect(),
+        init: None,
+        span: Span::from_span(start, end),
+    },
+    <start: @L><name: IDENT> <dims: ("[" ConstExp "]")*> "=" <init: InitVal><end: @R> => VarDef {
+        name,
+        dims: dims.into_iter().map(|(_, d, _)| d).collect(),
+        init: Some(init),
+        span: Span::from_span(start, end),
+    }
+};
+
+// InitVal ::= Exp | "{" [InitVal {"," InitVal}] "}";
+InitVal: InitVal = {
+    <expr: Exp> => InitVal::Single(expr),
+    <start: @L>"{" <first: InitVal?> <rest: ("," InitVal)*> "}"<end: @R> => {
+        let mut list = vec![];
+        if let Some(f) = first {
+            list.push(f);
+        }
+        list.extend(rest.into_iter().map(|(_, e)| e));
+        InitVal::List(list)
+    }
+};
+
+// 完全匹配的语句（不会再产生悬空 else）
+MatchedStmt: Stmt = {
+    // 空 / 表达式语句
+    <start: @L>";" <end: @R> => Stmt::Expr(None),
+    <start: @L><expr: Exp> ";" <end: @R> => Stmt::Expr(Some(expr)),
+
+    // 赋值
+    <start: @L><lval: LVal> "=" <expr: Exp> ";" <end: @R> => Stmt::Assign(lval, expr),
+
+    // Block
+    <block: Block> => Stmt::Block(block),
+
+    // while (cond) matched
+    <start: @L>"while" "(" <cond: Exp> ")" <body: MatchedStmt><end: @R> => Stmt::While {
+        cond,
+        body: Box::new(body),
+        span: Span::from_span(start, end),
+    },
+
+    // return
+    <start: @L>"return" <expr: Exp> ";" <end: @R> => Stmt::Return(Some(expr)),
+    <start: @L>"return" ";" <end: @R> => Stmt::Return(None),
+
+    // break
+    <start: @L>"break" ";" <end: @R> => Stmt::Break(Span::from_span(start, end)),
+
+    // continue
+    <start: @L>"continue" ";" <end: @R> => Stmt::Continue(Span::from_span(start, end)),
+
+    // if (cond) MatchedStmt else MatchedStmt
+    <start: @L>"if" "(" <cond: Exp> ")" <then_s: MatchedStmt> "else" <else_s: MatchedStmt><end: @R>
+        => Stmt::If {
+            cond,
+            then_stmt: Box::new(then_s),
+            else_stmt: Some(Box::new(else_s)),
+            span: Span::from_span(start, end),
+        },
+};
+
+// 可能“悬空”的 if（Open）
+OpenStmt: Stmt = {
+    // while (cond) OpenStmt
+    <start: @L>"while" "(" <cond: Exp> ")" <body: OpenStmt><end: @R> => Stmt::While {
+        cond,
+        body: Box::new(body),
+        span: Span::from_span(start, end),
+    },
+
+    // if (cond) Stmt    —— 无 else
+    <start: @L>"if" "(" <cond: Exp> ")" <then_s: Stmt><end: @R> => Stmt::If {
+        cond,
+        then_stmt: Box::new(then_s),
+        else_stmt: None,
+        span: Span::from_span(start, end),
+    },
+
+    // if (cond) MatchedStmt else OpenStmt
+    <start: @L>"if" "(" <cond: Exp> ")" <then_s: MatchedStmt> "else" <else_s: OpenStmt><end: @R>
+        => Stmt::If {
+            cond,
+            then_stmt: Box::new(then_s),
+            else_stmt: Some(Box::new(else_s)),
+            span: Span::from_span(start, end),
+        },
+};
+
+// 顶层语句：要么是完全匹配的，要么是 Open 的
+Stmt: Stmt = {
+    MatchedStmt,
+    OpenStmt,
+};
+
+Exp: Expr = {
+    LOrExp
+};
+
+LOrExp: Expr = {
+    LAndExp,
+    <start: @L><l: LOrExp> "||" <r: LAndExp><end: @R> => Expr::LOrOp(LOrOp::Or, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+LAndExp: Expr = {
+    EqExp,
+    <start: @L><l: LAndExp> "&&" <r: EqExp><end: @R> => Expr::LAndOp(LAndOp::And, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+EqExp: Expr = {
+    RelExp,
+    <start: @L><l: EqExp> "==" <r: RelExp><end: @R> => Expr::EqOp(EqOp::Eq, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: EqExp> "!=" <r: RelExp><end: @R> => Expr::EqOp(EqOp::Ne, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+RelExp: Expr = {
+    AddExp,
+    <start: @L><l: RelExp> "<" <r: AddExp><end: @R> => Expr::RelOp(RelOp::Lt, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: RelExp> ">" <r: AddExp><end: @R> => Expr::RelOp(RelOp::Gt, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: RelExp> "<=" <r: AddExp><end: @R> => Expr::RelOp(RelOp::Le, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: RelExp> ">=" <r: AddExp><end: @R> => Expr::RelOp(RelOp::Ge, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+AddExp: Expr = {
+    MulExp,
+    <start: @L><l: AddExp> "+" <r: MulExp><end: @R> => Expr::BinaryOp(BinaryOp::Add, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: AddExp> "-" <r: MulExp><end: @R> => Expr::BinaryOp(BinaryOp::Sub, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+MulExp: Expr = {
+    UnaryExp,
+    <start: @L><l: MulExp> "*" <r: UnaryExp><end: @R> => Expr::BinaryOp(BinaryOp::Mul, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: MulExp> "/" <r: UnaryExp><end: @R> => Expr::BinaryOp(BinaryOp::Div, Box::new(l), Box::new(r), Span::from_span(start, end)),
+    <start: @L><l: MulExp> "%" <r: UnaryExp><end: @R> => Expr::BinaryOp(BinaryOp::Mod, Box::new(l), Box::new(r), Span::from_span(start, end)),
+};
+
+UnaryExp: Expr = {
+    PrimaryExp,
+    <start: @L><op: UnaryOp> <expr: UnaryExp><end: @R> => Expr::UnaryOp(op, Box::new(expr), Span::from_span(start, end)),
+    <start: @L><name: IDENT> "(" <params: FuncRParams?> ")"<end: @R> => Expr::Call(name, params.unwrap_or_default(), Span::from_span(start, end))
+};
+
+PrimaryExp: Expr = {
+    "(" <expr: Exp> ")" => expr,
+    <lval: LVal> => Expr::LVal(lval),
+    Number
+};
+
+// LVal ::= IDENT {"[" Exp "]"};
+LVal: LVal = {
+    <start: @L><name: IDENT> <indices: ("[" Exp "]")*> <end: @R> => LVal {
+        name,
+        indices: indices.into_iter().map(|(_, e, _)| e).collect(),
+        span: Span::from_span(start, end),
+    }
+};
+
+Number: Expr = {
+    <start: @L><num: INT_CONST><end: @R> => Expr::IntLiteral(num, Span::from_span(start, end))
+};
+
+UnaryOp: UnaryOp = {
+    "+" => UnaryOp::Plus,
+    "-" => UnaryOp::Minus,
+    "!" => UnaryOp::Not,
+};
+
+FuncFParams: Vec<FuncFParam> = {
+    <first: FuncFParam> <rest: ("," FuncFParam)*> => {
+        let mut params = vec![first];
+        params.extend(rest.into_iter().map(|(_, p)| p));
+        params
+    }
+};
+
+FuncFParam: FuncFParam = {
+    <start: @L><ty: DataType> <name: IDENT> <arr: ("[" "]" ("[" ConstExp "]")*)?> <end: @R> =>  {
+        if ty == DataType::Void {
+            eprintln!("Error: 函数参数不允许使用 void 类型");
+            exit(1);
+        }
+        let mut is_array = false;
+        let mut dims = Vec::new();
+        if let Some((_l, _r, rest)) = arr {
+            is_array = true;
+            dims = rest.into_iter().map(|(_, d, _)| d).collect();
+        }
+        FuncFParam{
+            ty,
+            name,
+            is_array,
+            dims,
+            span: Span::from_span(start, end),
+        }
+    }
+};
+
+FuncRParams: Vec<Expr> = {
+    <first: Exp> <rest: ("," Exp)*> => {
+        let mut params = vec![first];
+        params.extend(rest.into_iter().map(|(_, e)| e));
+        params
+    }
+};
+
+IDENT: String = r"[_a-zA-Z][_a-zA-Z0-9]*" => <>.to_string();
+
+INT_CONST: i32 = {
+    r"[1-9][0-9]*" => (u128::from_str_radix(<>, 10).unwrap_or(0) as u32) as i32,
+    r"0[0-7]*" => (u128::from_str_radix(<>, 8).unwrap_or(0) as u32) as i32,
+    r"0[xX][0-9a-fA-F]+" => (u128::from_str_radix(&<>[2..], 16).unwrap_or(0) as u32) as i32,
+};
+
+// 约束 lexer 的行为
+match {
+  // 跳过空白符和注释
+  r"\s*" => {},
+  r"//[^\n\r]*[\n\r]*" => {},
+  r"/\*([^*]|\*+[^*/])*\*+/" => {}, 
+  // 剩下的情况采用默认方式处理
+  _
+}
